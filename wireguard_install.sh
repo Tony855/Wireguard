@@ -328,8 +328,8 @@ add_client() {
 
     client_private=$(wg genkey)
     client_preshared=$(wg genpsk)
-    peer_config="\n[Peer]\n# $client_name\nPublicKey = $(echo "$client_private" | wg pubkey)\nPresharedKey = $client_preshared\nAllowedIPs = $client_ip4/24"
-    [[ -n "$client_ip6" ]] && peer_config+=", $client_ip6/64"
+    peer_config="\n[Peer]\n# $client_name\nPublicKey = $(echo "$client_private" | wg pubkey)\nPresharedKey = $client_preshared\nAllowedIPs = $client_ip4/32"
+    [[ -n "$client_ip6" ]] && peer_config+=", $client_ip6/128"
     echo -e "$peer_config" >> "$CONFIG_DIR/$iface.conf"
 
     mkdir -p "$CLIENT_DIR/$iface"
