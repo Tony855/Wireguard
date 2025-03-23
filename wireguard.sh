@@ -681,14 +681,14 @@ install_pkgs() {
         (
             set -x
             apt-get -yqq update || apt-get -yqq update
-            apt-get -yqq install wireguard qrencode $firewall >/dev/null
+            apt-get -yqq install wireguard qrencode iftop $firewall >/dev/null
         ) || exiterr2
     elif [[ "$os" == "debian" ]]; then
         export DEBIAN_FRONTEND=noninteractive
         (
             set -x
             apt-get -yqq update || apt-get -yqq update
-            apt-get -yqq install wireguard qrencode $firewall >/dev/null
+            apt-get -yqq install wireguard qrencode iftop $firewall >/dev/null
         ) || exiterr2
     elif [[ "$os" == "centos" && "$os_version" -eq 9 ]]; then
         (
