@@ -17,7 +17,6 @@ exiterr3() { exiterr "'yum install' failed."; }
 exiterr4() { exiterr "'zypper install' failed."; }
 
 # 自动生成客户端名称函数
-# 自动生成客户端名称函数
 generate_client_name() {
     while true; do
         timestamp=$(date +%y%m%d%M%S)  # 增加分钟和秒
