@@ -193,13 +193,13 @@ create_interface() {
 
     cat > "$CONFIG_DIR/$FIXED_IFACE.conf" <<EOF
 [Interface]
-Address = ${SUBNET%.*}.1/24  # 正确：将子网分配给接口，但接口名称仍是 wg0
+Address = ${SUBNET%.*}.1/24
 PrivateKey = $server_private
 ListenPort = $port
 
-# NAT规则
-PostUp = iptables -t nat -A POSTROUTING -s $SUBNET -o $ext_if -j SNAT --to-source $public_ip
-PostDown = iptables -t nat -D POSTROUTING -s $SUBNET -o $ext_if -j SNAT --to-source $public_ip
+# 持久化 NAT 规则（防止重启丢失）
+PreUp = iptables -t nat -A POSTROUTING -s $SUBNET -o $ext_if -j SNAT --to-source $public_ip
+PreDown = iptables -t nat -D POSTROUTING -s $SUBNET -o $ext_if -j SNAT --to-source $public_ip
 EOF
 
     chmod 600 "$CONFIG_DIR/$FIXED_IFACE.conf"
@@ -292,31 +292,28 @@ EOF
             log "物理接口提取失败"
             return 1
         }
+        
         # 添加独立SNAT规则
         rule_up="iptables -t nat -I POSTROUTING 1 -s $client_ip/32 -o $ext_if -j SNAT --to-source $client_nat_ip"
         rule_down="iptables -t nat -D POSTROUTING -s $client_ip/32 -o $ext_if -j SNAT --to-source $client_nat_ip"
         
-                # 修改后的代码（检查规则是否存在）：
+        # 检查规则是否存在
         if ! grep -qF "PostUp = $rule_up" "$tmp_conf"; then
-                awk -v rule="$rule_up" '/PostUp =/ && !modif {print; print "PostUp = " rule; modif=1; next}1' "$tmp_conf" > "${tmp_conf}.new"
-                mv "${tmp_conf}.new" "$tmp_conf"
-            fi
-        
-            # 检查 PostDown 规则是否已存在
-            if ! grep -qF "PostDown = $rule_down" "$tmp_conf"; then
-                awk -v rule="$rule_down" '/PostDown =/ && !modif {print; print "PostDown = " rule; modif=1; next}1' "$tmp_conf" > "${tmp_conf}.new"
-                mv "${tmp_conf}.new" "$tmp_conf"
-            fi
+            awk -v rule="$rule_up" '/PostUp =/ && !modif {print; print "PostUp = " rule; modif=1; next}1' "$tmp_conf" > "${tmp_conf}.new"
+            mv "${tmp_conf}.new" "$tmp_conf"
         fi
         
-        awk -v rule="$rule_down" '/PostDown =/{print; print "PostDown = " rule; next}1' "$tmp_conf" > "${tmp_conf}.new"
-        mv "${tmp_conf}.new" "$tmp_conf"
+        if ! grep -qF "PostDown = $rule_down" "$tmp_conf"; then
+            awk -v rule="$rule_down" '/PostDown =/ && !modif {print; print "PostDown = " rule; modif=1; next}1' "$tmp_conf" > "${tmp_conf}.new"
+            mv "${tmp_conf}.new" "$tmp_conf"
+        fi
         
         if ! eval "$rule_up"; then
             echo "错误: iptables规则添加失败"
             log "iptables规则添加失败"
             return 1
         fi
+    fi
 
     # 保存配置
     chmod 600 "$tmp_conf"
@@ -369,7 +366,7 @@ EOF
     log "客户端添加成功: $client_name"
 }
 
-# 新增功能：删除客户端
+# 删除客户端
 delete_client() {
     echo "正在删除客户端..."
     log "开始删除客户端"
@@ -408,7 +405,7 @@ delete_client() {
     ' "$CONFIG_DIR/$FIXED_IFACE.conf" > "$tmp_conf"
 
     # 删除关联的iptables规则
-    ext_if=$(ip route show default | awk '/default/ {print $5; exit}')  # 重新获取物理接口
+    ext_if=$(ip route show default | awk '/default/ {print $5; exit}')
     nat_ips=$(iptables-save -t nat | grep "SNAT --to-source" | grep " -s $client_ip/32 " | awk '{print $NF}')
     for nat_ip in $nat_ips; do
         iptables -t nat -D POSTROUTING -s "$client_ip/32" -o "$ext_if" -j SNAT --to-source "$nat_ip"
@@ -427,7 +424,7 @@ delete_client() {
     log "客户端删除成功: $client_name"
 }
 
-# 新增功能：删除接口
+# 删除接口
 delete_interface() {
     read -p "确定要删除接口 $FIXED_IFACE 吗？(y/N) " confirm
     [[ ! $confirm =~ ^[Yy]$ ]] && return
@@ -454,28 +451,28 @@ delete_interface() {
     log "接口删除成功"
 }
 
-# 修改后的 restart_interface 函数：
+# 重启接口（优化版）
 restart_interface() {
     echo "正在重启接口..."
     log "尝试重启接口"
     
-    # 清理旧的 PostUp/PostDown 规则
-    if [ -f "$CONFIG_DIR/$FIXED_IFACE.conf" ]; then
-        tmp_conf=$(mktemp /tmp/wg_conf.XXXXXX)
-        grep -vE '^(PostUp|PostDown) = iptables -t nat' "$CONFIG_DIR/$FIXED_IFACE.conf" > "$tmp_conf"
-        mv "$tmp_conf" "$CONFIG_DIR/$FIXED_IFACE.conf"
-    fi
-    
-    if systemctl restart "wg-quick@$FIXED_IFACE"; then
-        echo "接口重启成功"
-        log "接口重启成功"
+    # 优先动态加载配置
+    if wg syncconf "$FIXED_IFACE" <(wg-quick strip "$FIXED_IFACE") 2>/dev/null; then
+        echo "配置已动态加载"
+        log "接口配置动态加载成功"
     else
-        echo "错误: 接口重启失败"
-        log "接口重启失败"
-        return 1
+        echo "警告: 动态加载失败，尝试完整重启接口..."
+        log "动态加载失败，开始完整重启"
+        systemctl restart "wg-quick@$FIXED_IFACE" && \
+        echo "接口重启成功" || {
+            echo "错误: 接口重启失败"
+            log "接口重启失败"
+            return 1
+        }
     fi
 }
 
+# 完全卸载
 uninstall_wireguard() {
     read -p "确定要完全卸载WireGuard吗？(y/N) " confirm
     [[ ! $confirm =~ ^[Yy]$ ]] && return
