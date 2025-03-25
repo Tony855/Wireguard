@@ -296,8 +296,11 @@ EOF
         rule_up="iptables -t nat -I POSTROUTING 1 -s $client_ip/32 -o $ext_if -j SNAT --to-source $client_nat_ip"
         rule_down="iptables -t nat -D POSTROUTING -s $client_ip/32 -o $ext_if -j SNAT --to-source $client_nat_ip"
         
-        awk -v rule="$rule_up" '/PostUp =/{print; print "PostUp = " rule; next}1' "$tmp_conf" > "${tmp_conf}.new"
-        mv "${tmp_conf}.new" "$tmp_conf"
+                # 修改后的代码（检查规则是否存在）：
+        if ! grep -qF "PostUp = $rule_up" "$tmp_conf"; then
+            awk -v rule="$rule_up" '/PostUp =/ && !added {print; print "PostUp = " rule; added=1; next}1' "$tmp_conf" > "${tmp_conf}.new"
+            mv "${tmp_conf}.new" "$tmp_conf"
+        fi
         
         awk -v rule="$rule_down" '/PostDown =/{print; print "PostDown = " rule; next}1' "$tmp_conf" > "${tmp_conf}.new"
         mv "${tmp_conf}.new" "$tmp_conf"
@@ -400,11 +403,10 @@ delete_client() {
 
     # 删除关联的iptables规则
     ext_if=$(grep 'POSTROUTING' "$CONFIG_DIR/$FIXED_IFACE.conf" | awk '{print $9}' | head -1)
-    custom_ip_rules=$(grep "SNAT --to-source" "$CONFIG_DIR/$FIXED_IFACE.conf" | grep "$client_ip")
-    if [ -n "$custom_ip_rules" ]; then
-        nat_ip=$(echo "$custom_ip_rules" | awk '{print $NF}')
+    nat_ips=$(iptables-save -t nat | grep "SNAT --to-source" | grep " -s $client_ip/32 " | awk '{print $NF}')
+    for nat_ip in $nat_ips; do
         iptables -t nat -D POSTROUTING -s "$client_ip/32" -o "$ext_if" -j SNAT --to-source "$nat_ip"
-    fi
+    done
 
     # 保存配置
     mv "$tmp_conf" "$CONFIG_DIR/$FIXED_IFACE.conf"
@@ -438,7 +440,9 @@ delete_interface() {
     fi
     
     # 清理iptables规则
-    iptables -t nat -F POSTROUTING
+    iptables-save -t nat | grep "SNAT --to-source" | grep " -s $SUBNET " | while read -r line; do
+        iptables -t nat -D POSTROUTING ${line#*-A POSTROUTING }
+    done
     
     echo "接口 $FIXED_IFACE 已删除"
     log "接口删除成功"
@@ -491,13 +495,14 @@ main_menu() {
             "删除接口") delete_interface ;;
             "完全卸载") uninstall_wireguard ;;
             "退出") 
-                iptables-save > /etc/iptables/rules.v4 2>/dev/null
                 echo "配置已保存，再见！"
                 log "脚本正常退出"
                 break ;;
             *) echo "无效选项" ;;
         esac
     done
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null
+    log "脚本正常退出"
 }
 
 # 初始化
