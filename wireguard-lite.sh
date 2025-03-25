@@ -298,8 +298,15 @@ EOF
         
                 # 修改后的代码（检查规则是否存在）：
         if ! grep -qF "PostUp = $rule_up" "$tmp_conf"; then
-            awk -v rule="$rule_up" '/PostUp =/ && !added {print; print "PostUp = " rule; added=1; next}1' "$tmp_conf" > "${tmp_conf}.new"
-            mv "${tmp_conf}.new" "$tmp_conf"
+                awk -v rule="$rule_up" '/PostUp =/ && !modif {print; print "PostUp = " rule; modif=1; next}1' "$tmp_conf" > "${tmp_conf}.new"
+                mv "${tmp_conf}.new" "$tmp_conf"
+            fi
+        
+            # 检查 PostDown 规则是否已存在
+            if ! grep -qF "PostDown = $rule_down" "$tmp_conf"; then
+                awk -v rule="$rule_down" '/PostDown =/ && !modif {print; print "PostDown = " rule; modif=1; next}1' "$tmp_conf" > "${tmp_conf}.new"
+                mv "${tmp_conf}.new" "$tmp_conf"
+            fi
         fi
         
         awk -v rule="$rule_down" '/PostDown =/{print; print "PostDown = " rule; next}1' "$tmp_conf" > "${tmp_conf}.new"
@@ -310,7 +317,6 @@ EOF
             log "iptables规则添加失败"
             return 1
         fi
-    fi
 
     # 保存配置
     chmod 600 "$tmp_conf"
@@ -402,7 +408,7 @@ delete_client() {
     ' "$CONFIG_DIR/$FIXED_IFACE.conf" > "$tmp_conf"
 
     # 删除关联的iptables规则
-    ext_if=$(grep 'POSTROUTING' "$CONFIG_DIR/$FIXED_IFACE.conf" | awk '{print $9}' | head -1)
+    ext_if=$(ip route show default | awk '/default/ {print $5; exit}')  # 重新获取物理接口
     nat_ips=$(iptables-save -t nat | grep "SNAT --to-source" | grep " -s $client_ip/32 " | awk '{print $NF}')
     for nat_ip in $nat_ips; do
         iptables -t nat -D POSTROUTING -s "$client_ip/32" -o "$ext_if" -j SNAT --to-source "$nat_ip"
@@ -448,9 +454,18 @@ delete_interface() {
     log "接口删除成功"
 }
 
-# 新增功能：重启接口
+# 修改后的 restart_interface 函数：
 restart_interface() {
     echo "正在重启接口..."
+    log "尝试重启接口"
+    
+    # 清理旧的 PostUp/PostDown 规则
+    if [ -f "$CONFIG_DIR/$FIXED_IFACE.conf" ]; then
+        tmp_conf=$(mktemp /tmp/wg_conf.XXXXXX)
+        grep -vE '^(PostUp|PostDown) = iptables -t nat' "$CONFIG_DIR/$FIXED_IFACE.conf" > "$tmp_conf"
+        mv "$tmp_conf" "$CONFIG_DIR/$FIXED_IFACE.conf"
+    fi
+    
     if systemctl restart "wg-quick@$FIXED_IFACE"; then
         echo "接口重启成功"
         log "接口重启成功"
