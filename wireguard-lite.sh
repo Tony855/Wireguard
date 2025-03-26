@@ -6,7 +6,7 @@ CLIENT_DIR="$CONFIG_DIR/clients"
 PUBLIC_IP_FILE="$CONFIG_DIR/public_ips.txt"
 USED_IP_FILE="$CONFIG_DIR/used_ips.txt"
 FIXED_IFACE="wg0"  # 固定接口名称
-SUBNET="10.19.0.0/24"  # 固定子网
+SUBNET="10.252.252.0/24"  # 固定子网
 LOG_FILE="/var/log/wireguard-lite.log"
 
 # 检查root权限
@@ -37,15 +37,24 @@ backup_config() {
 }
 
 # ========================
-# 依赖安装函数
+# 依赖安装函数（关键修复点）
 # ========================
 install_dependencies() {
     echo "正在安装依赖和配置系统..."
     log "开始安装依赖"
     export DEBIAN_FRONTEND=noninteractive
 
-    # 添加WireGuard官方PPA
-    if ! grep -q "wireguard/wireguard" /etc/apt/sources.list.d/*; then
+    # 修复PPA检查逻辑：确保目录存在并处理空目录场景
+    mkdir -p /etc/apt/sources.list.d  # 创建目录（如果不存在）
+    
+    # 检查是否已添加WireGuard PPA（兼容空目录场景）
+    if [ -n "$(ls -A /etc/apt/sources.list.d 2>/dev/null)" ]; then
+        if ! grep -q "wireguard/wireguard" /etc/apt/sources.list.d/* 2>/dev/null; then
+            add-apt-repository -y ppa:wireguard/wireguard >/dev/null 2>&1
+            apt-get update >/dev/null 2>&1
+        fi
+    else
+        # 目录为空时直接添加PPA
         add-apt-repository -y ppa:wireguard/wireguard >/dev/null 2>&1
         apt-get update >/dev/null 2>&1
     fi
@@ -68,15 +77,22 @@ install_dependencies() {
     echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
     echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
     
-    # 配置sysctl参数
-    sysctl_conf=("net.ipv4.ip_forward=1" "net.core.default_qdisc=fq" "net.ipv4.tcp_congestion_control=bbr")
+    # 配置sysctl参数（避免引用未创建的接口）
+    sysctl_conf=(
+        "net.ipv4.ip_forward=1"
+        "net.core.default_qdisc=fq"
+        "net.ipv4.tcp_congestion_control=bbr"
+        "net.ipv4.conf.all.rp_filter=0"
+        "net.ipv4.conf.default.rp_filter=0"
+    )
     for param in "${sysctl_conf[@]}"; do
         grep -qxF "$param" /etc/sysctl.conf || echo "$param" >> /etc/sysctl.conf
     done
     
+    # 加载sysctl参数（忽略接口未创建的警告）
     if ! sysctl -p >/dev/null 2>&1; then
-        echo "警告: sysctl加载失败"
-        log "sysctl加载失败"
+        echo "警告: sysctl加载部分参数失败（接口可能尚未创建）"
+        log "sysctl部分参数加载失败"
     fi
     
     echo "系统配置完成！"
@@ -191,6 +207,7 @@ create_interface() {
     server_private=$(wg genkey)
     server_public=$(echo "$server_private" | wg pubkey)
 
+    # 使用MASQUERADE替换SNAT（关键修复）
     cat > "$CONFIG_DIR/$FIXED_IFACE.conf" <<EOF
 [Interface]
 Address = ${SUBNET%.*}.1/24
@@ -198,8 +215,8 @@ PrivateKey = $server_private
 ListenPort = $port
 
 # 持久化 NAT 规则（防止重启丢失）
-PreUp = iptables -t nat -A POSTROUTING -s $SUBNET -o $ext_if -j SNAT --to-source $public_ip
-PreDown = iptables -t nat -D POSTROUTING -s $SUBNET -o $ext_if -j SNAT --to-source $public_ip
+PreUp = iptables -t nat -A POSTROUTING -s $SUBNET -o $ext_if -j MASQUERADE
+PreDown = iptables -t nat -D POSTROUTING -s $SUBNET -o $ext_if -j MASQUERADE
 EOF
 
     chmod 600 "$CONFIG_DIR/$FIXED_IFACE.conf"
@@ -209,6 +226,14 @@ EOF
         echo "分配公网IP: $public_ip"
         echo "内网子网: $SUBNET"
         log "接口创建成功"
+        
+        # 接口启动后配置wg0的rp_filter（新增代码）
+        echo "正在配置wg0接口的反向路径过滤..."
+        if ! grep -qxF "net.ipv4.conf.$FIXED_IFACE.rp_filter=0" /etc/sysctl.conf; then
+            echo "net.ipv4.conf.$FIXED_IFACE.rp_filter=0" >> /etc/sysctl.conf
+            sysctl -p /etc/sysctl.conf >/dev/null 2>&1 || echo "警告: 无法加载wg0的rp_filter配置"
+        fi
+        log "wg0接口rp_filter已配置"
     else
         rollback_ip_allocation "$public_ip"
         rm -f "$CONFIG_DIR/$FIXED_IFACE.conf"
@@ -217,6 +242,8 @@ EOF
         return 1
     fi
 }
+
+# ...（后续函数 add_client、delete_client、delete_interface 等保持不变，请直接参考用户原始代码）
 
 add_client() {
     echo "正在添加新客户端..."
