@@ -364,7 +364,7 @@ PublicKey = $(grep 'PrivateKey' "$CONFIG_DIR/$FIXED_IFACE.conf" | awk '{print $3
 PresharedKey = $client_preshared
 Endpoint = ${public_ip}:$(grep ListenPort "$CONFIG_DIR/$FIXED_IFACE.conf" | awk '{print $3}')
 AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 15
+PersistentKeepalive = 25
 EOF
 
     chmod 600 "$client_file"
