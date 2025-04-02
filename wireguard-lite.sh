@@ -6,7 +6,7 @@ CLIENT_DIR="$CONFIG_DIR/clients"
 PUBLIC_IP_FILE="$CONFIG_DIR/public_ips.txt"
 USED_IP_FILE="$CONFIG_DIR/used_ips.txt"
 FIXED_IFACE="wg0"  # 固定接口名称
-SUBNET="10.252.252.0/24"  # 固定子网
+SUBNET="10.199.199.0/24"  # 固定子网
 LOG_FILE="/var/log/wireguard-lite.log"
 
 # 检查root权限
