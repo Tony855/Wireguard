@@ -159,7 +159,7 @@ create_interface() {
 [Interface]
 Address = ${SUBNET%.*}.1/24
 PrivateKey = $server_private
-ListenPort = 51820
+ListenPort = 51620
 
 PreUp = iptables -t nat -A POSTROUTING -s $SUBNET -o %i -j MASQUERADE
 PostDown = iptables -t nat -D POSTROUTING -s $SUBNET -o %i -j MASQUERADE
@@ -226,7 +226,7 @@ DNS = 8.8.8.8
 
 [Peer]
 PublicKey = $server_public
-Endpoint = ${SERVER_PUBLIC_IP}:51820
+Endpoint = ${SERVER_PUBLIC_IP}:51620
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 PresharedKey = $client_preshared
