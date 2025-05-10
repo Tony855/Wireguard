@@ -50,6 +50,9 @@ install_dependencies() {
         echo "依赖安装失败"; log "依赖安装失败"; exit 1
     }
 
+    # 启用iptables持久化服务
+    systemctl enable netfilter-persistent >/dev/null 2>&1
+
     # 配置系统参数
     sysctl_conf=(
         "net.ipv4.ip_forward=1"
@@ -212,7 +215,7 @@ PresharedKey = $client_preshared
 AllowedIPs = $client_ip/32
 EOF
 
-    # ================ SNAT规则变量化处理 ================
+    # ================ SNAT规则持久化处理 ================
     ext_if=$(ip route show default | awk '{print $5; exit}')
     [ -z "$ext_if" ] && {
         echo "错误: 无法获取默认路由接口" 
@@ -230,12 +233,14 @@ EOF
     eval "$rule_up"
     mkdir -p "$CLIENT_DIR"
     client_file="$CLIENT_DIR/${client_nat_ip}.conf"
-    echo "SNAT_UP='$rule_up'" >> "$client_file"
-    echo "SNAT_DOWN='$rule_down'" >> "$client_file"
+
+    # 保存iptables规则到持久化文件
+    iptables-save > /etc/iptables/rules.v4
     # ================ 修改结束 ================
 
     # 生成客户端配置（使用服务器公网IP）
-    cat > "$client_file" <<EOF
+    cat >> "$client_file" <<EOF
+
 [Interface]
 PrivateKey = $client_private
 Address = $client_ip/32
@@ -273,12 +278,15 @@ delete_client() {
     client_file="$CLIENT_DIR/$1.conf"
     [ -f "$client_file" ] || { echo "客户端不存在"; exit 1; }
 
-    # ================ SNAT规则变量化处理 ================
+    # ================ SNAT规则持久化处理 ================
     # 从配置文件加载规则并删除
     source "$client_file"
     if [ -n "$SNAT_DOWN" ]; then
         eval "$SNAT_DOWN" 2>/dev/null || echo "警告: 规则删除失败（可能已不存在）"
     fi
+
+    # 保存iptables规则到持久化文件
+    iptables-save > /etc/iptables/rules.v4
     # ================ 修改结束 ================
 
     release_ip "$1"
