@@ -9,6 +9,7 @@ FIXED_IFACE="wg0"
 SUBNET="10.20.0.0/24"
 LOG_FILE="/var/log/wireguard-lite.log"
 SERVER_PUBLIC_IP=""
+PHYSICAL_IFACE="eth0"  # 物理接口名（根据实际情况修改）
 
 # 检查root权限
 if [ "$EUID" -ne 0 ]; then
@@ -161,8 +162,8 @@ Address = ${SUBNET%.*}.1/24
 PrivateKey = $server_private
 ListenPort = 51620
 
-PreUp = iptables -t nat -A POSTROUTING -s $SUBNET -o %i -j MASQUERADE
-PostDown = iptables -t nat -D POSTROUTING -s $SUBNET -o %i -j MASQUERADE
+PreUp = iptables -t nat -A POSTROUTING -s $SUBNET -o $PHYSICAL_IFACE -j MASQUERADE
+PostDown = iptables -t nat -D POSTROUTING -s $SUBNET -o $PHYSICAL_IFACE -j MASQUERADE
 EOF
 
     systemctl enable --now wg-quick@$FIXED_IFACE &>/dev/null || {
@@ -211,13 +212,29 @@ PresharedKey = $client_preshared
 AllowedIPs = $client_ip/32
 EOF
 
-    # 配置SNAT规则
+    # ================ SNAT规则变量化处理 ================
     ext_if=$(ip route show default | awk '{print $5; exit}')
-    iptables -t nat -A POSTROUTING -s $client_ip/32 -o $ext_if -j SNAT --to-source $client_nat_ip
+    [ -z "$ext_if" ] && {
+        echo "错误: 无法获取默认路由接口" 
+        release_ip "$client_nat_ip"
+        exit 1
+    }
 
-    # 生成客户端配置（使用服务器公网IP）
+    # 生成固化规则变量
+    printf -v rule_up "iptables -t nat -I POSTROUTING 1 -s %s/32 -o %s -j SNAT --to-source %s" \
+        "$client_ip" "$ext_if" "$client_nat_ip"
+    printf -v rule_down "iptables -t nat -D POSTROUTING -s %s/32 -o %s -j SNAT --to-source %s" \
+        "$client_ip" "$ext_if" "$client_nat_ip"
+
+    # 执行规则添加并持久化
+    eval "$rule_up"
     mkdir -p "$CLIENT_DIR"
     client_file="$CLIENT_DIR/${client_nat_ip}.conf"
+    echo "SNAT_UP='$rule_up'" >> "$client_file"
+    echo "SNAT_DOWN='$rule_down'" >> "$client_file"
+    # ================ 修改结束 ================
+
+    # 生成客户端配置（使用服务器公网IP）
     cat > "$client_file" <<EOF
 [Interface]
 PrivateKey = $client_private
@@ -256,13 +273,17 @@ delete_client() {
     client_file="$CLIENT_DIR/$1.conf"
     [ -f "$client_file" ] || { echo "客户端不存在"; exit 1; }
 
+    # ================ SNAT规则变量化处理 ================
+    # 从配置文件加载规则并删除
+    source "$client_file"
+    if [ -n "$SNAT_DOWN" ]; then
+        eval "$SNAT_DOWN" 2>/dev/null || echo "警告: 规则删除失败（可能已不存在）"
+    fi
+    # ================ 修改结束 ================
+
     release_ip "$1"
 
     client_ip=$(grep 'Address = ' "$client_file" | awk '{print $3}' | cut -d/ -f1)
-    iptables-save -t nat | grep "SNAT --to-source $1" | while read -r rule; do
-        iptables -t nat -D ${rule#-A}
-    done
-
     sed -i "/# $1$/,+4d" "$CONFIG_DIR/$FIXED_IFACE.conf"
     rm -f "$client_file" "${client_file}.png"
 
