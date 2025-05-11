@@ -6,7 +6,7 @@ CLIENT_DIR="$CONFIG_DIR/clients"
 PUBLIC_IP_FILE="$CONFIG_DIR/public_ips.txt"
 USED_IP_FILE="$CONFIG_DIR/used_ips.txt"
 FIXED_IFACE="wg0"
-SUBNET="10.20.0.0/24"
+SUBNET="10.20.1.0/24"
 LOG_FILE="/var/log/wireguard-lite.log"
 SERVER_PUBLIC_IP=""
 PHYSICAL_IFACE="eth0"  # 物理接口名（根据实际情况修改）
@@ -215,7 +215,7 @@ PresharedKey = $client_preshared
 AllowedIPs = $client_ip/32
 EOF
 
-    # ================ SNAT规则持久化处理 ================
+    # ================ SNAT规则处理 ================
     ext_if=$(ip route show default | awk '{print $5; exit}')
     [ -z "$ext_if" ] && {
         echo "错误: 无法获取默认路由接口" 
@@ -223,28 +223,20 @@ EOF
         exit 1
     }
 
-    # 生成固化规则变量
-    printf -v rule_up "iptables -t nat -I POSTROUTING 1 -s %s/32 -o %s -j SNAT --to-source %s" \
-        "$client_ip" "$ext_if" "$client_nat_ip"
-    printf -v rule_down "iptables -t nat -D POSTROUTING -s %s/32 -o %s -j SNAT --to-source %s" \
-        "$client_ip" "$ext_if" "$client_nat_ip"
-
-    # 执行规则添加并持久化
-    eval "$rule_up"
-    mkdir -p "$CLIENT_DIR"
-    client_file="$CLIENT_DIR/${client_nat_ip}.conf"
-
-    # 保存iptables规则到持久化文件
+    # 添加SNAT规则
+    iptables -t nat -I POSTROUTING 1 -s "$client_ip/32" -o "$ext_if" -j SNAT --to-source "$client_nat_ip"
+    # 持久化规则
     iptables-save > /etc/iptables/rules.v4
-    # ================ 修改结束 ================
 
     # 生成客户端配置（使用服务器公网IP）
-    cat >> "$client_file" <<EOF
-
+    mkdir -p "$CLIENT_DIR"
+    client_file="$CLIENT_DIR/${client_nat_ip}.conf"
+    cat > "$client_file" <<EOF
 [Interface]
 PrivateKey = $client_private
-Address = $client_ip/32
+Address = $client_ip/24
 DNS = 8.8.8.8
+MTU = 1420
 
 [Peer]
 PublicKey = $server_public
@@ -278,25 +270,28 @@ delete_client() {
     client_file="$CLIENT_DIR/$1.conf"
     [ -f "$client_file" ] || { echo "客户端不存在"; exit 1; }
 
-    # ================ SNAT规则持久化处理 ================
-    # 从配置文件加载规则并删除
-    source "$client_file"
-    if [ -n "$SNAT_DOWN" ]; then
-        eval "$SNAT_DOWN" 2>/dev/null || echo "警告: 规则删除失败（可能已不存在）"
-    fi
-
-    # 保存iptables规则到持久化文件
+    # ================ SNAT规则处理 ================
+    client_ip=$(grep 'Address = ' "$client_file" | awk '{print $3}' | cut -d/ -f1)
+    ext_if=$(ip route show default | awk '{print $5; exit}')
+    
+    # 删除SNAT规则
+    iptables -t nat -D POSTROUTING -s "$client_ip/32" -o "$ext_if" -j SNAT --to-source "$1" 2>/dev/null || \
+        echo "警告: SNAT规则删除失败（可能已不存在）"
+    # 持久化规则
     iptables-save > /etc/iptables/rules.v4
-    # ================ 修改结束 ================
 
     release_ip "$1"
-
-    client_ip=$(grep 'Address = ' "$client_file" | awk '{print $3}' | cut -d/ -f1)
-    sed -i "/# $1$/,+4d" "$CONFIG_DIR/$FIXED_IFACE.conf"
+    
+    # 关键修复：使用空行作为Peer块结束标记
+    sed -i "/^# $1$/,/^$/d" "$CONFIG_DIR/$FIXED_IFACE.conf"
+    
     rm -f "$client_file" "${client_file}.png"
 
-    if ! wg syncconf $FIXED_IFACE <(wg-quick strip $FIXED_IFACE); then
+    # 关键修复：增强配置同步稳定性
+    if ! wg-quick strip $FIXED_IFACE | wg syncconf $FIXED_IFACE /dev/stdin; then
+        echo "配置动态加载失败，尝试完整重启..."
         systemctl restart wg-quick@$FIXED_IFACE
+        log "配置动态加载失败，已执行完整重启"
     fi
 
     echo "客户端 $1 已删除"
@@ -340,8 +335,10 @@ uninstall_wireguard() {
         wireguard-dkms \
         wireguard-tools-dbgsym 2>/dev/null
 
+    # 清除内存中的规则并删除持久化文件
     iptables-save | grep -v "WireGuard" | iptables-restore
     ip6tables-save | grep -v "WireGuard" | ip6tables-restore
+    rm -f /etc/iptables/rules.v4
 
     sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
     sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
