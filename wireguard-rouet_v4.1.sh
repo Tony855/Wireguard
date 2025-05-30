@@ -159,6 +159,7 @@ create_interface() {
 Address = $server_ip
 PrivateKey = $server_private
 ListenPort = $port
+Mtu = 1420
 # 由系统内核处理路由转发
 PostUp = iptables -t nat -A POSTROUTING -o $ext_if -j MASQUERADE
 PostDown = iptables -t nat -D POSTROUTING -o $ext_if -j MASQUERADE
