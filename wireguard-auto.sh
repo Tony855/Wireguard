@@ -6,7 +6,7 @@ CLIENT_DIR="$CONFIG_DIR/clients"
 PUBLIC_IP_FILE="$CONFIG_DIR/public_ips.txt"
 USED_IP_FILE="$CONFIG_DIR/used_ips.txt"
 FIXED_IFACE="wg0"
-SUBNET="10.20.1.0/24"
+SUBNET="10.20.102.0/24"
 LOG_FILE="/var/log/wireguard-lite.log"
 SERVER_PUBLIC_IP=""
 PHYSICAL_IFACE="eth0"  # 物理接口名（根据实际情况修改）
@@ -68,6 +68,45 @@ install_dependencies() {
 
     echo "系统配置完成"
     log "依赖安装完成"
+}
+
+# ========================
+# 公网IP自动检测
+# ========================
+detect_public_ips() {
+    echo "正在自动检测公网IP..."
+    log "开始检测公网IP"
+    
+    local public_ips=()
+    while IFS= read -r ip; do
+        IFS=. read -r a b c d <<< "$ip"
+        private=false
+        [[ $a -eq 10 ]] && private=true
+        [[ $a -eq 172 && $b -ge 16 && $b -le 31 ]] && private=true
+        [[ $a -eq 192 && $b -eq 168 ]] && private=true
+        [[ $a -eq 127 ]] && private=true
+        [[ $a -eq 169 && $b -eq 254 ]] && private=true
+
+        if ! $private; then
+            public_ips+=("$ip")
+        fi
+    done < <(ip -4 addr show 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d'/' -f1)
+
+    if [ ${#public_ips[@]} -eq 0 ]; then
+        log "尝试通过metadata获取云厂商公网IP"
+        cloud_ip=$(curl -s --connect-timeout 2 http://169.254.169.254/latest/meta-data/public-ipv4 || true)
+        [ -n "$cloud_ip" ] && public_ips+=("$cloud_ip")
+    fi
+
+    if [ ${#public_ips[@]} -gt 0 ]; then
+        printf "%s\n" "${public_ips[@]}" > "$PUBLIC_IP_FILE"
+        echo "检测到公网IP：${public_ips[*]}"
+        log "公网IP已保存"
+    else
+        echo "错误: 未检测到公网IP，请手动创建 $PUBLIC_IP_FILE"
+        log "公网IP检测失败"
+        exit 1
+    fi
 }
 
 # ========================
@@ -142,6 +181,11 @@ generate_client_ip() {
 }
 
 create_interface() {
+    # 自动检测公网IP（如果公网IP池文件不存在）
+    if [ ! -f "$PUBLIC_IP_FILE" ]; then
+        detect_public_ips
+    fi
+    
     init_ip_pool
     echo "正在创建WireGuard接口..."
     log "接口创建开始"
@@ -173,12 +217,25 @@ EOF
         echo "接口启动失败"; log "接口启动失败"; exit 1
     }
 
+    # 新增：保存服务器信息到配置文件
+    echo "SERVER_PUBLIC_IP=$SERVER_PUBLIC_IP" > "$CONFIG_DIR/server_info.conf"
+    echo "server_public=$server_public" >> "$CONFIG_DIR/server_info.conf"
+    chmod 600 "$CONFIG_DIR/server_info.conf"
+
     echo "接口 $FIXED_IFACE 创建成功"
     echo "服务器公网IP: $SERVER_PUBLIC_IP"
     log "接口创建成功"
 }
 
 add_client() {
+    # 新增：读取服务器信息
+    if [ -f "$CONFIG_DIR/server_info.conf" ]; then
+        source "$CONFIG_DIR/server_info.conf"
+    else
+        echo "错误：未找到服务器配置信息，请先创建接口。"
+        exit 1
+    fi
+
     validate_client_ip_allocation
     echo "正在添加新客户端..."
     log "开始添加客户端"
