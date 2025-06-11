@@ -7,7 +7,7 @@ CONFIG_DIR="/etc/wireguard"
 CLIENT_DIR="$CONFIG_DIR/clients"
 PUBLIC_IP_FILE="$CONFIG_DIR/public_ips.txt"
 USED_IP_FILE="$CONFIG_DIR/used_ips.txt"
-FIXED_IFACE="wg2"
+FIXED_IFACE="wg1"
 LOG_FILE="/var/log/wireguard-lite.log"
 ROUTE_MAPPING="$CONFIG_DIR/route_mappings.json"
 
