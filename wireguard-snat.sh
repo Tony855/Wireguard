@@ -7,21 +7,56 @@ CONFIG_DIR="/etc/wireguard"
 CLIENT_DIR="$CONFIG_DIR/clients"
 PUBLIC_IP_FILE="$CONFIG_DIR/public_ips.txt"
 USED_IP_FILE="$CONFIG_DIR/used_ips.txt"
-FIXED_IFACE="wg0"
+FIXED_IFACE="wg1"
 LOG_FILE="/var/log/wireguard-lite.log"
-NAT_MAPPING="$CONFIG_DIR/nat_mappings.json"
+ROUTE_MAPPING="$CONFIG_DIR/route_mappings.json"
 
 # ========================
 # 初始化函数
 # ========================
 init_resources() {
-    [ ! -f "$PUBLIC_IP_FILE" ] && {
-        echo "错误: 请先创建公网IP池文件 $PUBLIC_IP_FILE"
-        echo "文件格式：每行一个公网IP地址"
-        exit 1
-    }
+    [ ! -f "$PUBLIC_IP_FILE" ] && detect_public_ips
     touch "$USED_IP_FILE"
-    [ ! -f "$NAT_MAPPING" ] && echo "{}" > "$NAT_MAPPING"
+    [ ! -f "$ROUTE_MAPPING" ] && echo "{}" > "$ROUTE_MAPPING"
+}
+
+# ========================
+# 公网IP自动检测
+# ========================
+detect_public_ips() {
+    echo "正在自动检测公网IP..."
+    log "开始检测公网IP"
+    
+    local public_ips=()
+    while IFS= read -r ip; do
+        IFS=. read -r a b c d <<< "$ip"
+        private=false
+        [[ $a -eq 10 ]] && private=true
+        [[ $a -eq 172 && $b -ge 16 && $b -le 31 ]] && private=true
+        [[ $a -eq 192 && $b -eq 168 ]] && private=true
+        [[ $a -eq 127 ]] && private=true
+        [[ $a -eq 169 && $b -eq 254 ]] && private=true
+
+        if ! $private; then
+            public_ips+=("$ip")
+        fi
+    done < <(ip -4 addr show 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d'/' -f1)
+
+    if [ ${#public_ips[@]} -eq 0 ]; then
+        log "尝试通过metadata获取云厂商公网IP"
+        cloud_ip=$(curl -s --connect-timeout 2 http://169.254.169.254/latest/meta-data/public-ipv4 || true)
+        [ -n "$cloud_ip" ] && public_ips+=("$cloud_ip")
+    fi
+
+    if [ ${#public_ips[@]} -gt 0 ]; then
+        printf "%s\n" "${public_ips[@]}" > "$PUBLIC_IP_FILE"
+        echo "检测到公网IP：${public_ips[*]}"
+        log "公网IP已保存"
+    else
+        echo "错误: 未检测到公网IP，请手动创建 $PUBLIC_IP_FILE"
+        log "公网IP检测失败"
+        exit 1
+    fi
 }
 
 # ========================
@@ -44,7 +79,7 @@ show_remaining_public_ips() {
 }
 
 # ========================
-# 依赖安装函数
+# 依赖安装
 # ========================
 install_dependencies() {
     echo "正在安装依赖..."
@@ -55,7 +90,7 @@ install_dependencies() {
     apt-get update >/dev/null 2>&1
     apt-get install -y --install-recommends \
         wireguard-tools iptables iptables-persistent \
-        sipcalc qrencode curl iftop jq >/dev/null 2>&1 || {
+        sipcalc qrencode curl iftop jq >/dev/null 2>&1 || { 
         echo "错误: 依赖安装失败"
         log "依赖安装失败"
         exit 1
@@ -111,15 +146,21 @@ create_interface() {
         return 1
     }
 
+    # 确保服务器IP以/24结尾
+    [[ "$server_ip" =~ /[0-9]+$ ]] || server_ip="$server_ip/24"
+
     ext_if=$(ip route show default | awk '/default/ {print $5; exit}')
     port=$(shuf -i 51620-52000 -n 1)
     server_private=$(wg genkey)
 
+    # 修复：添加NAT规则
     cat > "$CONFIG_DIR/$FIXED_IFACE.conf" <<EOF
 [Interface]
-Address = $server_ip/32
+Address = $server_ip
 PrivateKey = $server_private
 ListenPort = $port
+Mtu = 1420
+# 由系统内核处理路由转发
 PostUp = iptables -t nat -A POSTROUTING -o $ext_if -j MASQUERADE
 PostDown = iptables -t nat -D POSTROUTING -o $ext_if -j MASQUERADE
 EOF
@@ -135,54 +176,71 @@ EOF
     }
 }
 
+# ========================
+# 添加客户端（路由器）
+# ========================
 add_client() {
-    echo "正在添加客户端（路由器）..."
-    log "添加客户端开始"
+    echo "正在添加路由型客户端..."
+    log "添加路由型客户端开始"
     [ ! -f "$CONFIG_DIR/$FIXED_IFACE.conf" ] && {
         echo "错误: 请先创建接口"
         return 1
     }
 
-    read -p "客户端名称（例如office）: " client_name
+    read -p "客户端名称（例如office-router）: " client_name
     [[ "$client_name" =~ [/\\] ]] && {
         echo "错误: 名称包含非法字符"
         return 1
     }
 
-    read -p "请输入客户端子网（例如192.168.1.0/24）: " client_subnet
+    read -p "请输入客户端需路由的子网（例如192.168.1.0/24）: " client_subnet
     validate_subnet "$client_subnet" || return 1
 
-    # 生成密钥对
     client_private=$(wg genkey)
     client_public=$(echo "$client_private" | wg pubkey)
     server_public=$(wg show "$FIXED_IFACE" public-key)
 
-    # 更新服务端配置
-    tmp_conf=$(mktemp)
-    awk -v subnet="$client_subnet" -v pubkey="$client_public" '
-    /^\[Peer\]/ {in_peer=1}
-    in_peer && /^$/ {
-        print "\n[Peer]"
-        print "PublicKey = " pubkey
-        print "AllowedIPs = " subnet
-        in_peer=0
-        next
+    server_subnet=$(grep 'Address' "$CONFIG_DIR/$FIXED_IFACE.conf" | awk -F= '{print $2}' | tr -d ' ')
+    base_net=$(echo $server_subnet | cut -d'/' -f1 | sed 's/\.[0-9]*$//')
+    
+    # 修复：获取所有已使用的隧道IP（包括服务器IP）
+    used_ips=(
+        $(grep 'Address' "$CONFIG_DIR/$FIXED_IFACE.conf" | awk -F= '{print $2}' | cut -d'/' -f1)
+        $(grep 'AllowedIPs' "$CONFIG_DIR/$FIXED_IFACE.conf" | awk -F= '{print $2}' | tr ',' '\n' | awk '{print $1}' | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+    )
+    
+    # 查找可用的隧道IP（从.2开始）
+    for i in {2..254}; do
+        candidate_ip="${base_net}.$i"
+        if ! printf '%s\n' "${used_ips[@]}" | grep -q "^${candidate_ip}$"; then
+            client_tunnel_ip="$candidate_ip"
+            break
+        fi
+    done
+    
+    [ -z "$client_tunnel_ip" ] && {
+        echo "错误: 找不到可用的隧道IP地址"
+        return 1
     }
-    {print}
-    ' "$CONFIG_DIR/$FIXED_IFACE.conf" > "$tmp_conf"
-    mv "$tmp_conf" "$CONFIG_DIR/$FIXED_IFACE.conf"
 
-    # 生成客户端配置
+    # 修复：在服务器配置中添加Peer
+    {
+        echo -e "\n[Peer]"
+        echo "PublicKey = $client_public"
+        echo "AllowedIPs = $client_subnet, $client_tunnel_ip/32"
+    } >> "$CONFIG_DIR/$FIXED_IFACE.conf"
+
     mkdir -p "$CLIENT_DIR/$FIXED_IFACE"
     client_file="$CLIENT_DIR/$FIXED_IFACE/$client_name.conf"
-    server_port=$(wg show "$FIXED_IFACE" listen-port | awk '{print $NF}')
-    server_public_ip=$(curl -s ifconfig.me)
     
+    server_port=$(grep 'ListenPort' "$CONFIG_DIR/$FIXED_IFACE.conf" | awk -F= '{print $2}' | tr -d ' ')
+    server_public_ip=$(head -n 1 "$PUBLIC_IP_FILE")
+
+    # 修复：客户端配置使用正确的隧道IP
     cat > "$client_file" <<EOF
 [Interface]
 PrivateKey = $client_private
-Address = $(echo "$client_subnet" | sed 's/0\/24/1\/24/')
-DNS = 8.8.8.8
+Address = $client_tunnel_ip/24
 
 [Peer]
 PublicKey = $server_public
@@ -195,12 +253,17 @@ EOF
     chmod 600 "$client_file"
 
     wg syncconf "$FIXED_IFACE" <(wg-quick strip "$FIXED_IFACE") >/dev/null
-    echo "客户端添加成功！子网: $client_subnet"
-    log "客户端 $client_name 添加成功"
+    echo "路由型客户端添加成功！"
+    echo "客户端子网: $client_subnet"
+    echo "隧道端点IP: $client_tunnel_ip（仅用于建立连接）"
+    log "路由型客户端 $client_name 添加成功"
 }
 
+# ========================
+# 下游设备管理（使用SNAT）
+# ========================
 add_downstream() {
-    echo "正在添加下游设备..."
+    echo "正在添加下游设备（SNAT）..."
     log "添加下游设备开始"
     [ ! -f "$CONFIG_DIR/$FIXED_IFACE.conf" ] && {
         echo "错误: 请先创建接口"
@@ -210,9 +273,20 @@ add_downstream() {
     read -p "输入客户端子网（例如192.168.1.0/24）: " client_subnet
     validate_subnet "$client_subnet" || return 1
 
+    # 检查子网掩码必须为24
+    mask=$(echo "$client_subnet" | cut -d'/' -f2)
+    if [ "$mask" -ne 24 ]; then
+        echo "错误: 下游设备只支持/24子网"
+        return 1
+    fi
+
     read -p "需要分配的公网IP数量: " ip_count
     [[ "$ip_count" =~ ^[0-9]+$ ]] || {
         echo "错误: 请输入有效数字"
+        return 1
+    }
+    [ $ip_count -lt 1 ] && {
+        echo "错误: 至少分配1个公网IP"
         return 1
     }
 
@@ -221,24 +295,27 @@ add_downstream() {
         return 1
     }
 
-    ext_if=$(ip route show default | awk '{print $5; exit}')
     base_ip=$(echo "$client_subnet" | awk -F'[./]' '{print $1"."$2"."$3"."}')
     mappings=()
 
-    for i in $(seq 2 $((ip_count+1))); do
-        downstream_ip="${base_ip}${i}"
-        public_ip="${public_ips[$((i-2))]}"
-        
-        iptables -t nat -A POSTROUTING -s "$downstream_ip/32" -o "$ext_if" -j SNAT --to-source "$public_ip"
+    for i in $(seq 1 $ip_count); do
+        downstream_ip="${base_ip}$((i+1))"  # 从.2开始分配
+        public_ip="${public_ips[$((i-1))]}"
+
+        # 添加SNAT规则
+        iptables -t nat -A POSTROUTING -s "$downstream_ip" -j SNAT --to-source "$public_ip"
         mappings+=("$downstream_ip:$public_ip")
     done
 
-    netfilter-persistent save >/dev/null 2>&1
+    # 保存规则
+    netfilter-persistent save >/dev/null
 
+    # 更新映射文件
     for map in "${mappings[@]}"; do
         dip=$(echo "$map" | cut -d: -f1)
         pub=$(echo "$map" | cut -d: -f2)
-        jq --arg dip "$dip" --arg pub "$pub" '. + { ($dip): $pub }' "$NAT_MAPPING" > tmp.json && mv tmp.json "$NAT_MAPPING"
+        jq --arg dip "$dip" --arg pub "$pub" \
+           '. + { ($dip): $pub }' "$ROUTE_MAPPING" > tmp.json && mv tmp.json "$ROUTE_MAPPING"
     done
 
     echo "下游设备添加成功！"
@@ -249,58 +326,50 @@ add_downstream() {
 }
 
 delete_downstream() {
-    echo "正在删除下游设备..."
+    echo "正在删除下游设备（SNAT）..."
     log "删除下游设备开始"
     read -p "输入下游设备私有IP（或输入 all 删除所有）: " downstream_ip
 
     if [ "$downstream_ip" = "all" ]; then
-        # 删除所有下游设备
-        count=$(jq 'length' "$NAT_MAPPING")
-        [ "$count" -eq 0 ] && {
-            echo "无下游设备可删除"
-            return 0
-        }
-
-        jq -r 'keys[]' "$NAT_MAPPING" | while read -r dip; do
-            public_ip=$(jq -r ".\"$dip\"" "$NAT_MAPPING")
-            ext_if=$(ip route show default | awk '{print $5; exit}')
-            iptables -t nat -D POSTROUTING -s "$dip/32" -o "$ext_if" -j SNAT --to-source "$public_ip" 2>/dev/null
+        jq -r 'keys[]' "$ROUTE_MAPPING" | while read -r dip; do
+            public_ip=$(jq -r ".\"$dip\"" "$ROUTE_MAPPING")
+            # 删除SNAT规则
+            iptables -t nat -D POSTROUTING -s "$dip" -j SNAT --to-source "$public_ip" 2>/dev/null
             sed -i "/^$public_ip$/d" "$USED_IP_FILE"
         done
 
-        echo "{}" > "$NAT_MAPPING"
-        netfilter-persistent save >/dev/null 2>&1
+        echo "{}" > "$ROUTE_MAPPING"
         echo "已删除所有下游设备"
         show_remaining_public_ips
         log "所有下游设备已删除"
     else
-        # 处理单个IP
-        public_ip=$(jq -r ".\"$downstream_ip\"" "$NAT_MAPPING")
-        [ "$public_ip" = "null" ] && {
+        public_ip=$(jq -r ".\"$downstream_ip\"" "$ROUTE_MAPPING")
+        [ -z "$public_ip" ] || [ "$public_ip" = "null" ] && {
             echo "错误: 未找到映射记录"
             return 1
         }
 
-        ext_if=$(ip route show default | awk '{print $5; exit}')
-        iptables -t nat -D POSTROUTING -s "$downstream_ip/32" -o "$ext_if" -j SNAT --to-source "$public_ip" 2>/dev/null
-
-        netfilter-persistent save >/dev/null 2>&1
+        # 删除SNAT规则
+        iptables -t nat -D POSTROUTING -s "$downstream_ip" -j SNAT --to-source "$public_ip" 2>/dev/null
         sed -i "/^$public_ip$/d" "$USED_IP_FILE"
-        jq "del(.\"$downstream_ip\")" "$NAT_MAPPING" > tmp.json && mv tmp.json "$NAT_MAPPING"
-
+        jq "del(.\"$downstream_ip\")" "$ROUTE_MAPPING" > tmp.json && mv tmp.json "$ROUTE_MAPPING"
+        
         echo "已删除下游设备 $downstream_ip"
         show_remaining_public_ips
         log "下游设备 $downstream_ip 已删除"
     fi
+
+    # 保存规则
+    netfilter-persistent save >/dev/null
 }
 
 # ========================
-# 状态管理函数
+# 状态管理
 # ========================
 show_mappings() {
-    echo "当前NAT映射状态："
-    jq -r 'to_entries[] | "\(.key) => \(.value)"' "$NAT_MAPPING"
-    [ $(jq length "$NAT_MAPPING") -eq 0 ] && echo "无映射记录"
+    echo "当前路由映射状态："
+    jq -r 'to_entries[] | "\(.key) => \(.value)"' "$ROUTE_MAPPING"
+    [ $(jq length "$ROUTE_MAPPING") -eq 0 ] && echo "无映射记录"
 }
 
 restart_interface() {
@@ -310,6 +379,23 @@ restart_interface() {
 delete_interface() {
     read -p "确认删除接口？(y/N) " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || return
+    
+    # 清除所有下游设备映射
+    if [ -f "$ROUTE_MAPPING" ]; then
+        count=$(jq 'length' "$ROUTE_MAPPING")
+        if [ "$count" -gt 0 ]; then
+            echo "正在清除所有下游设备映射..."
+            jq -r 'keys[]' "$ROUTE_MAPPING" | while read -r dip; do
+                public_ip=$(jq -r ".\"$dip\"" "$ROUTE_MAPPING")
+                iptables -t nat -D POSTROUTING -s "$dip" -j SNAT --to-source "$public_ip" 2>/dev/null
+                sed -i "/^$public_ip$/d" "$USED_IP_FILE"
+            done
+            echo "{}" > "$ROUTE_MAPPING"
+            netfilter-persistent save >/dev/null
+            echo "已删除 $count 个下游设备映射"
+        fi
+    fi
+    
     systemctl stop "wg-quick@$FIXED_IFACE"
     rm -f "$CONFIG_DIR/$FIXED_IFACE.conf"
     echo "接口已删除"
@@ -318,6 +404,20 @@ delete_interface() {
 uninstall_wireguard() {
     read -p "确认完全卸载？(y/N) " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || return
+    
+    # 清除所有下游设备映射
+    if [ -f "$ROUTE_MAPPING" ]; then
+        count=$(jq 'length' "$ROUTE_MAPPING")
+        if [ "$count" -gt 0 ]; then
+            echo "正在清除所有下游设备映射..."
+            jq -r 'keys[]' "$ROUTE_MAPPING" | while read -r dip; do
+                public_ip=$(jq -r ".\"$dip\"" "$ROUTE_MAPPING")
+                iptables -t nat -D POSTROUTING -s "$dip" -j SNAT --to-source "$public_ip" 2>/dev/null
+                sed -i "/^$public_ip$/d" "$USED_IP_FILE"
+            done
+        fi
+    fi
+    
     systemctl stop "wg-quick@$FIXED_IFACE"
     apt-get purge -y wireguard-tools iptables-persistent qrencode jq
     rm -rf "$CONFIG_DIR"
@@ -335,7 +435,7 @@ main_menu() {
         "添加客户端（路由器）"
         "添加下游设备"
         "删除下游设备"
-        "查看NAT映射"
+        "查看路由映射"
         "重启接口"
         "删除接口"
         "完全卸载"
