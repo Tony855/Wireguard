@@ -7,9 +7,7 @@ CONFIG_DIR="/etc/wireguard"
 CLIENT_DIR="$CONFIG_DIR/clients"
 PUBLIC_IP_FILE="$CONFIG_DIR/public_ips.txt"
 USED_IP_FILE="$CONFIG_DIR/used_ips.txt"
-FIXED_IFACE="wg1"
 LOG_FILE="/var/log/wireguard-lite.log"
-ROUTE_MAPPING="$CONFIG_DIR/route_mappings.json"
 
 # ========================
 # 初始化函数
@@ -17,7 +15,14 @@ ROUTE_MAPPING="$CONFIG_DIR/route_mappings.json"
 init_resources() {
     [ ! -f "$PUBLIC_IP_FILE" ] && detect_public_ips
     touch "$USED_IP_FILE"
-    [ ! -f "$ROUTE_MAPPING" ] && echo "{}" > "$ROUTE_MAPPING"
+    
+    # 为每个接口初始化路由映射文件
+    for iface_conf in "$CONFIG_DIR"/*.conf; do
+        [ ! -f "$iface_conf" ] && continue
+        iface=$(basename "$iface_conf" .conf)
+        local route_mapping="$CONFIG_DIR/route_mappings_${iface}.json"
+        [ ! -f "$route_mapping" ] && echo "{}" > "$route_mapping"
+    done
 }
 
 # ========================
@@ -79,25 +84,189 @@ show_remaining_public_ips() {
 }
 
 # ========================
-# 依赖安装
+# 接口管理函数
+# ========================
+list_interfaces() {
+    ls /etc/wireguard/*.conf 2>/dev/null | sed 's/.*\///; s/\.conf$//' | grep -v '^wg-snat-restore$'
+}
+
+select_interface() {
+    local interfaces=($(list_interfaces))
+    if [ ${#interfaces[@]} -eq 0 ]; then
+        echo "没有可用的WireGuard接口，请先创建一个。"
+        return 1
+    fi
+
+    PS3="请选择接口: "
+    select iface in "${interfaces[@]}" "返回主菜单"; do
+        if [[ $REPLY -ge 1 && $REPLY -le ${#interfaces[@]} ]]; then
+            selected_iface="${interfaces[$((REPLY-1))]}"
+            break
+        elif [[ $REPLY -eq $((${#interfaces[@]}+1)) ]]; then
+            return 2
+        else
+            echo "无效的选择，请重新输入。"
+        fi
+    done
+    
+    echo "$selected_iface"
+    return 0
+}
+
+get_route_mapping() {
+    local iface=$1
+    echo "$CONFIG_DIR/route_mappings_${iface}.json"
+}
+
+# ========================
+# 规则持久化管理
+# ========================
+install_persistence() {
+    # 创建规则恢复脚本
+    cat > /usr/local/bin/restore-wg-snat.sh <<'EOF'
+#!/bin/bash
+CONFIG_DIR="/etc/wireguard"
+LOG_FILE="/var/log/wireguard-lite.log"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+# 恢复所有接口的SNAT规则
+for route_mapping in "$CONFIG_DIR"/route_mappings_*.json; do
+    [ ! -f "$route_mapping" ] && continue
+    
+    # 从文件名中提取接口名称
+    iface=$(basename "$route_mapping" | sed 's/route_mappings_//; s/\.json//')
+    
+    jq -r 'to_entries[] | "\(.key) \(.value)"' "$route_mapping" | while read -r dip pub; do
+        # 检查规则是否存在
+        if ! iptables -t nat -C POSTROUTING -s "$dip" -j SNAT --to-source "$pub" 2>/dev/null; then
+            log "恢复丢失的SNAT规则[$iface]: $dip => $pub"
+            # 修复：使用-I插入到链的顶部
+            iptables -t nat -I POSTROUTING 1 -s "$dip" -j SNAT --to-source "$pub"
+        fi
+    done
+done
+
+# 重启所有WireGuard接口（仅当服务未运行时）
+for iface_conf in /etc/wireguard/*.conf; do
+    iface_name=$(basename "$iface_conf" .conf)
+    if [[ "$iface_name" == "wg-snat-restore" ]]; then
+        continue  # 跳过我们的服务配置文件
+    fi
+    
+    if ! systemctl is-active --quiet "wg-quick@$iface_name"; then
+        log "重启WireGuard接口: $iface_name"
+        systemctl restart "wg-quick@$iface_name"
+    fi
+done
+EOF
+
+    chmod +x /usr/local/bin/restore-wg-snat.sh
+    
+    # 添加定时任务（每5分钟检查一次）
+    if ! crontab -l 2>/dev/null | grep -q "restore-wg-snat.sh"; then
+        (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/restore-wg-snat.sh") | crontab -
+        log "添加SNAT规则监控定时任务"
+    fi
+    
+    # 启动时恢复规则
+    cat > /etc/systemd/system/wg-snat-restore.service <<EOF
+[Unit]
+Description=Restore WireGuard SNAT Rules
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/restore-wg-snat.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable wg-snat-restore.service >/dev/null 2>&1
+    log "安装SNAT规则恢复服务"
+}
+
+# ========================
+# 依赖安装（支持Debian和Ubuntu）
 # ========================
 install_dependencies() {
     echo "正在安装依赖..."
     log "开始安装依赖"
     export DEBIAN_FRONTEND=noninteractive
 
-    add-apt-repository -y ppa:wireguard/wireguard >/dev/null 2>&1
-    apt-get update >/dev/null 2>&1
-    apt-get install -y --install-recommends \
-        wireguard-tools iptables iptables-persistent \
-        sipcalc qrencode curl iftop jq >/dev/null 2>&1 || { 
-        echo "错误: 依赖安装失败"
-        log "依赖安装失败"
+    # 检测操作系统
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+        VERSION=$VERSION_ID
+    else
+        echo "错误: 无法确定操作系统类型"
+        log "无法确定操作系统类型"
+        exit 1
+    fi
+
+    # 更新包列表
+    apt-get update >/dev/null 2>&1 || {
+        echo "错误: 无法更新包列表"
+        log "更新包列表失败"
         exit 1
     }
 
-    systemctl enable --now netfilter-persistent >/dev/null 2>&1
+    # 安装通用依赖
+    apt-get install -y --no-install-recommends \
+        iptables iptables-persistent \
+        sipcalc qrencode curl jq cron iftop >/dev/null 2>&1
+        
+    # 安装WireGuard
+    if [[ "$OS" == "debian" ]]; then
+        echo "检测到Debian系统 $VERSION"
+        
+        # 对于Debian 10 (Buster) 和 11 (Bullseye)
+        if [[ "$VERSION" == "10" || "$VERSION" == "11" ]]; then
+            # 添加backports源
+            echo "deb http://deb.debian.org/debian ${VERSION_CODENAME}-backports main" > /etc/apt/sources.list.d/backports.list
+            apt-get update >/dev/null 2>&1
+            apt-get install -y -t ${VERSION_CODENAME}-backports wireguard-tools >/dev/null 2>&1
+        else
+            # 对于Debian 12+ 或其他版本
+            apt-get install -y wireguard-tools >/dev/null 2>&1
+        fi
+    elif [[ "$OS" == "ubuntu" ]]; then
+        echo "检测到Ubuntu系统 $VERSION"
+        
+        # 安装PPA支持
+        apt-get install -y software-properties-common >/dev/null 2>&1
+        add-apt-repository -y ppa:wireguard/wireguard >/dev/null 2>&1
+        apt-get update >/dev/null 2>&1
+        apt-get install -y wireguard-tools >/dev/null 2>&1
+    else
+        echo "错误: 不支持的操作系统: $OS"
+        log "不支持的操作系统: $OS"
+        exit 1
+    fi
 
+    # 检查所有包是否安装成功
+    local missing=()
+    for pkg in wireguard-tools iptables iptables-persistent sipcalc qrencode curl jq cron iftop; do
+        if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+            missing+=("$pkg")
+        fi
+    done
+    
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "错误: 以下依赖安装失败: ${missing[*]}"
+        log "依赖安装失败: ${missing[*]}"
+        exit 1
+    fi
+
+    systemctl enable --now netfilter-persistent >/dev/null 2>&1
+    systemctl enable --now cron >/dev/null 2>&1
+
+    # 配置内核参数
     sysctl_conf=(
         "net.ipv4.ip_forward=1"
         "net.core.default_qdisc=fq"
@@ -108,6 +277,9 @@ install_dependencies() {
     done
     sysctl -p >/dev/null 2>&1
 
+    # 安装持久化机制
+    install_persistence
+    
     echo "系统配置完成！"
     log "依赖安装完成"
 }
@@ -135,7 +307,13 @@ create_interface() {
     echo "正在创建WireGuard接口..."
     log "创建接口开始"
 
-    [ -f "$CONFIG_DIR/$FIXED_IFACE.conf" ] && {
+    read -p "请输入接口名称（例如wg0, wg1）: " iface
+    [[ "$iface" =~ ^[a-zA-Z0-9]+$ ]] || {
+        echo "错误: 接口名称只能包含字母和数字"
+        return 1
+    }
+
+    [ -f "$CONFIG_DIR/$iface.conf" ] && {
         echo "错误: 接口已存在"
         return 1
     }
@@ -149,29 +327,33 @@ create_interface() {
     # 确保服务器IP以/24结尾
     [[ "$server_ip" =~ /[0-9]+$ ]] || server_ip="$server_ip/24"
 
-    ext_if=$(ip route show default | awk '/default/ {print $5; exit}')
     port=$(shuf -i 51620-52000 -n 1)
     server_private=$(wg genkey)
 
-    # 修复：添加NAT规则
-    cat > "$CONFIG_DIR/$FIXED_IFACE.conf" <<EOF
+    # 创建接口配置 - 移除了所有MASQUERADE规则
+    cat > "$CONFIG_DIR/$iface.conf" <<EOF
 [Interface]
 Address = $server_ip
 PrivateKey = $server_private
 ListenPort = $port
 Mtu = 1420
-# 由系统内核处理路由转发
-PostUp = iptables -t nat -A POSTROUTING -o $ext_if -j MASQUERADE
-PostDown = iptables -t nat -D POSTROUTING -o $ext_if -j MASQUERADE
+# 移除了MASQUERADE规则
 EOF
 
-    chmod 600 "$CONFIG_DIR/$FIXED_IFACE.conf"
-    systemctl enable --now "wg-quick@$FIXED_IFACE" >/dev/null && {
-        echo "接口创建成功！"
-        log "接口创建成功"
+    chmod 600 "$CONFIG_DIR/$iface.conf"
+    systemctl enable --now "wg-quick@$iface" >/dev/null && {
+        echo "接口 $iface 创建成功！"
+        log "接口 $iface 创建成功"
+        
+        # 创建接口专属目录
+        mkdir -p "$CLIENT_DIR/$iface"
+        
+        # 初始化路由映射文件
+        local route_mapping=$(get_route_mapping "$iface")
+        [ ! -f "$route_mapping" ] && echo "{}" > "$route_mapping"
     } || {
         echo "错误: 服务启动失败"
-        rm -f "$CONFIG_DIR/$FIXED_IFACE.conf"
+        rm -f "$CONFIG_DIR/$iface.conf"
         return 1
     }
 }
@@ -182,8 +364,20 @@ EOF
 add_client() {
     echo "正在添加路由型客户端..."
     log "添加路由型客户端开始"
-    [ ! -f "$CONFIG_DIR/$FIXED_IFACE.conf" ] && {
-        echo "错误: 请先创建接口"
+    
+    # 选择接口
+    iface=$(select_interface)
+    if [ $? -ne 0 ]; then
+        return $?
+    fi
+    
+    [ -z "$iface" ] && {
+        echo "错误: 未选择接口"
+        return 1
+    }
+    
+    [ ! -f "$CONFIG_DIR/$iface.conf" ] && {
+        echo "错误: 接口 $iface 不存在"
         return 1
     }
 
@@ -198,15 +392,15 @@ add_client() {
 
     client_private=$(wg genkey)
     client_public=$(echo "$client_private" | wg pubkey)
-    server_public=$(wg show "$FIXED_IFACE" public-key)
+    server_public=$(wg show "$iface" public-key)
 
-    server_subnet=$(grep 'Address' "$CONFIG_DIR/$FIXED_IFACE.conf" | awk -F= '{print $2}' | tr -d ' ')
+    server_subnet=$(grep 'Address' "$CONFIG_DIR/$iface.conf" | awk -F= '{print $2}' | tr -d ' ')
     base_net=$(echo $server_subnet | cut -d'/' -f1 | sed 's/\.[0-9]*$//')
     
-    # 修复：获取所有已使用的隧道IP（包括服务器IP）
+    # 获取所有已使用的隧道IP（包括服务器IP）
     used_ips=(
-        $(grep 'Address' "$CONFIG_DIR/$FIXED_IFACE.conf" | awk -F= '{print $2}' | cut -d'/' -f1)
-        $(grep 'AllowedIPs' "$CONFIG_DIR/$FIXED_IFACE.conf" | awk -F= '{print $2}' | tr ',' '\n' | awk '{print $1}' | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+        $(grep 'Address' "$CONFIG_DIR/$iface.conf" | awk -F= '{print $2}' | cut -d'/' -f1)
+        $(grep 'AllowedIPs' "$CONFIG_DIR/$iface.conf" | awk -F= '{print $2}' | tr ',' '\n' | awk '{print $1}' | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
     )
     
     # 查找可用的隧道IP（从.2开始）
@@ -223,20 +417,20 @@ add_client() {
         return 1
     }
 
-    # 修复：在服务器配置中添加Peer
+    # 在服务器配置中添加Peer
     {
         echo -e "\n[Peer]"
         echo "PublicKey = $client_public"
         echo "AllowedIPs = $client_subnet, $client_tunnel_ip/32"
-    } >> "$CONFIG_DIR/$FIXED_IFACE.conf"
+    } >> "$CONFIG_DIR/$iface.conf"
 
-    mkdir -p "$CLIENT_DIR/$FIXED_IFACE"
-    client_file="$CLIENT_DIR/$FIXED_IFACE/$client_name.conf"
+    mkdir -p "$CLIENT_DIR/$iface"
+    client_file="$CLIENT_DIR/$iface/$client_name.conf"
     
-    server_port=$(grep 'ListenPort' "$CONFIG_DIR/$FIXED_IFACE.conf" | awk -F= '{print $2}' | tr -d ' ')
+    server_port=$(grep 'ListenPort' "$CONFIG_DIR/$iface.conf" | awk -F= '{print $2}' | tr -d ' ')
     server_public_ip=$(head -n 1 "$PUBLIC_IP_FILE")
 
-    # 修复：客户端配置使用正确的隧道IP
+    # 客户端配置使用正确的隧道IP
     cat > "$client_file" <<EOF
 [Interface]
 PrivateKey = $client_private
@@ -252,11 +446,12 @@ EOF
     qrencode -t ansiutf8 < "$client_file"
     chmod 600 "$client_file"
 
-    wg syncconf "$FIXED_IFACE" <(wg-quick strip "$FIXED_IFACE") >/dev/null
+    wg syncconf "$iface" <(wg-quick strip "$iface") >/dev/null
     echo "路由型客户端添加成功！"
+    echo "接口: $iface"
     echo "客户端子网: $client_subnet"
     echo "隧道端点IP: $client_tunnel_ip（仅用于建立连接）"
-    log "路由型客户端 $client_name 添加成功"
+    log "接口 $iface 添加路由型客户端 $client_name"
 }
 
 # ========================
@@ -265,8 +460,20 @@ EOF
 add_downstream() {
     echo "正在添加下游设备（SNAT）..."
     log "添加下游设备开始"
-    [ ! -f "$CONFIG_DIR/$FIXED_IFACE.conf" ] && {
-        echo "错误: 请先创建接口"
+    
+    # 选择接口
+    iface=$(select_interface)
+    if [ $? -ne 0 ]; then
+        return $?
+    fi
+    
+    [ -z "$iface" ] && {
+        echo "错误: 未选择接口"
+        return 1
+    }
+    
+    [ ! -f "$CONFIG_DIR/$iface.conf" ] && {
+        echo "错误: 接口 $iface 不存在"
         return 1
     }
 
@@ -302,8 +509,15 @@ add_downstream() {
         downstream_ip="${base_ip}$((i+1))"  # 从.2开始分配
         public_ip="${public_ips[$((i-1))]}"
 
-        # 添加SNAT规则
-        iptables -t nat -A POSTROUTING -s "$downstream_ip" -j SNAT --to-source "$public_ip"
+        # 删除可能存在的旧规则
+        iptables -t nat -D POSTROUTING -s "$downstream_ip" -j SNAT --to-source "$public_ip" 2>/dev/null || true
+        
+        # 修复：使用-I插入到链的顶部
+        iptables -t nat -I POSTROUTING 1 -s "$downstream_ip" -j SNAT --to-source "$public_ip"
+        
+        # 添加永久规则
+        iptables-save > /etc/iptables/rules.v4
+        
         mappings+=("$downstream_ip:$public_ip")
     done
 
@@ -311,56 +525,78 @@ add_downstream() {
     netfilter-persistent save >/dev/null
 
     # 更新映射文件
+    local route_mapping=$(get_route_mapping "$iface")
     for map in "${mappings[@]}"; do
         dip=$(echo "$map" | cut -d: -f1)
         pub=$(echo "$map" | cut -d: -f2)
         jq --arg dip "$dip" --arg pub "$pub" \
-           '. + { ($dip): $pub }' "$ROUTE_MAPPING" > tmp.json && mv tmp.json "$ROUTE_MAPPING"
+           '. + { ($dip): $pub }' "$route_mapping" > tmp.json && mv tmp.json "$route_mapping"
     done
 
+    # 确保持久化机制已安装
+    if [ ! -f "/usr/local/bin/restore-wg-snat.sh" ]; then
+        install_persistence
+    fi
+
     echo "下游设备添加成功！"
+    echo "接口: $iface"
     echo "子网: $client_subnet"
     echo "分配的公网IP: ${public_ips[@]}"
     show_remaining_public_ips
-    log "添加下游设备完成"
+    log "接口 $iface 添加下游设备"
 }
 
 delete_downstream() {
     echo "正在删除下游设备（SNAT）..."
     log "删除下游设备开始"
+    
+    # 选择接口
+    iface=$(select_interface)
+    if [ $? -ne 0 ]; then
+        return $?
+    fi
+    
+    [ -z "$iface" ] && {
+        echo "错误: 未选择接口"
+        return 1
+    }
+    
+    local route_mapping=$(get_route_mapping "$iface")
+
     read -p "输入下游设备私有IP（或输入 all 删除所有）: " downstream_ip
 
     if [ "$downstream_ip" = "all" ]; then
-        jq -r 'keys[]' "$ROUTE_MAPPING" | while read -r dip; do
-            public_ip=$(jq -r ".\"$dip\"" "$ROUTE_MAPPING")
+        jq -r 'keys[]' "$route_mapping" | while read -r dip; do
+            public_ip=$(jq -r ".\"$dip\"" "$route_mapping")
             # 删除SNAT规则
-            iptables -t nat -D POSTROUTING -s "$dip" -j SNAT --to-source "$public_ip" 2>/dev/null
+            iptables -t nat -D POSTROUTING -s "$dip" -j SNAT --to-source "$public_ip" 2>/dev/null || true
             sed -i "/^$public_ip$/d" "$USED_IP_FILE"
         done
 
-        echo "{}" > "$ROUTE_MAPPING"
+        echo "{}" > "$route_mapping"
         echo "已删除所有下游设备"
         show_remaining_public_ips
-        log "所有下游设备已删除"
+        log "接口 $iface 所有下游设备已删除"
     else
-        public_ip=$(jq -r ".\"$downstream_ip\"" "$ROUTE_MAPPING")
+        public_ip=$(jq -r ".\"$downstream_ip\"" "$route_mapping")
         [ -z "$public_ip" ] || [ "$public_ip" = "null" ] && {
             echo "错误: 未找到映射记录"
             return 1
         }
 
         # 删除SNAT规则
-        iptables -t nat -D POSTROUTING -s "$downstream_ip" -j SNAT --to-source "$public_ip" 2>/dev/null
+        iptables -t nat -D POSTROUTING -s "$downstream_ip" -j SNAT --to-source "$public_ip" 2>/dev/null || true
         sed -i "/^$public_ip$/d" "$USED_IP_FILE"
-        jq "del(.\"$downstream_ip\")" "$ROUTE_MAPPING" > tmp.json && mv tmp.json "$ROUTE_MAPPING"
+        jq "del(.\"$downstream_ip\")" "$route_mapping" > tmp.json && mv tmp.json "$route_mapping"
         
         echo "已删除下游设备 $downstream_ip"
         show_remaining_public_ips
-        log "下游设备 $downstream_ip 已删除"
+        log "接口 $iface 下游设备 $downstream_ip 已删除"
     fi
 
     # 保存规则
     netfilter-persistent save >/dev/null
+    iptables-save > /etc/iptables/rules.v4
 }
 
 # ========================
@@ -368,60 +604,125 @@ delete_downstream() {
 # ========================
 show_mappings() {
     echo "当前路由映射状态："
-    jq -r 'to_entries[] | "\(.key) => \(.value)"' "$ROUTE_MAPPING"
-    [ $(jq length "$ROUTE_MAPPING") -eq 0 ] && echo "无映射记录"
+    local has_mappings=false
+    
+    for route_mapping in "$CONFIG_DIR"/route_mappings_*.json; do
+        [ ! -f "$route_mapping" ] && continue
+        
+        iface=$(basename "$route_mapping" | sed 's/route_mappings_//; s/\.json//')
+        count=$(jq 'length' "$route_mapping")
+        
+        if [ "$count" -gt 0 ]; then
+            has_mappings=true
+            echo "接口: $iface"
+            jq -r 'to_entries[] | "  \(.key) => \(.value)"' "$route_mapping"
+        fi
+    done
+    
+    if ! $has_mappings; then
+        echo "无映射记录"
+    fi
 }
 
 restart_interface() {
-    systemctl restart "wg-quick@$FIXED_IFACE" && echo "接口已重启" || echo "接口重启失败"
+    iface=$(select_interface)
+    if [ $? -ne 0 ]; then
+        return $?
+    fi
+    
+    [ -z "$iface" ] && {
+        echo "错误: 未选择接口"
+        return 1
+    }
+    
+    systemctl restart "wg-quick@$iface" && echo "接口 $iface 已重启" || echo "接口 $iface 重启失败"
 }
 
 delete_interface() {
-    read -p "确认删除接口？(y/N) " confirm
+    iface=$(select_interface)
+    if [ $? -ne 0 ]; then
+        return $?
+    fi
+    
+    [ -z "$iface" ] && {
+        echo "错误: 未选择接口"
+        return 1
+    }
+    
+    read -p "确认删除接口 $iface？(y/N) " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || return
     
-    # 清除所有下游设备映射
-    if [ -f "$ROUTE_MAPPING" ]; then
-        count=$(jq 'length' "$ROUTE_MAPPING")
+    # 清除该接口的所有下游设备映射
+    local route_mapping=$(get_route_mapping "$iface")
+    if [ -f "$route_mapping" ]; then
+        count=$(jq 'length' "$route_mapping")
         if [ "$count" -gt 0 ]; then
-            echo "正在清除所有下游设备映射..."
-            jq -r 'keys[]' "$ROUTE_MAPPING" | while read -r dip; do
-                public_ip=$(jq -r ".\"$dip\"" "$ROUTE_MAPPING")
-                iptables -t nat -D POSTROUTING -s "$dip" -j SNAT --to-source "$public_ip" 2>/dev/null
+            echo "正在清除接口 $iface 的下游设备映射..."
+            jq -r 'keys[]' "$route_mapping" | while read -r dip; do
+                public_ip=$(jq -r ".\"$dip\"" "$route_mapping")
+                iptables -t nat -D POSTROUTING -s "$dip" -j SNAT --to-source "$public_ip" 2>/dev/null || true
                 sed -i "/^$public_ip$/d" "$USED_IP_FILE"
             done
-            echo "{}" > "$ROUTE_MAPPING"
-            netfilter-persistent save >/dev/null
             echo "已删除 $count 个下游设备映射"
         fi
     fi
     
-    systemctl stop "wg-quick@$FIXED_IFACE"
-    rm -f "$CONFIG_DIR/$FIXED_IFACE.conf"
-    echo "接口已删除"
+    systemctl stop "wg-quick@$iface"
+    rm -f "$CONFIG_DIR/$iface.conf"
+    rm -f "$route_mapping"
+    
+    # 删除客户端配置目录
+    rm -rf "$CLIENT_DIR/$iface"
+    
+    echo "接口 $iface 已删除"
+    log "接口 $iface 已删除"
 }
 
 uninstall_wireguard() {
     read -p "确认完全卸载？(y/N) " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || return
     
-    # 清除所有下游设备映射
-    if [ -f "$ROUTE_MAPPING" ]; then
-        count=$(jq 'length' "$ROUTE_MAPPING")
+    # 清除所有接口的下游设备映射
+    for route_mapping in "$CONFIG_DIR"/route_mappings_*.json; do
+        [ ! -f "$route_mapping" ] && continue
+        
+        iface=$(basename "$route_mapping" | sed 's/route_mappings_//; s/\.json//')
+        count=$(jq 'length' "$route_mapping")
         if [ "$count" -gt 0 ]; then
-            echo "正在清除所有下游设备映射..."
-            jq -r 'keys[]' "$ROUTE_MAPPING" | while read -r dip; do
-                public_ip=$(jq -r ".\"$dip\"" "$ROUTE_MAPPING")
-                iptables -t nat -D POSTROUTING -s "$dip" -j SNAT --to-source "$public_ip" 2>/dev/null
+            echo "正在清除接口 $iface 的下游设备映射..."
+            jq -r 'keys[]' "$route_mapping" | while read -r dip; do
+                public_ip=$(jq -r ".\"$dip\"" "$route_mapping")
+                iptables -t nat -D POSTROUTING -s "$dip" -j SNAT --to-source "$public_ip" 2>/dev/null || true
                 sed -i "/^$public_ip$/d" "$USED_IP_FILE"
             done
         fi
-    fi
+    done
     
-    systemctl stop "wg-quick@$FIXED_IFACE"
-    apt-get purge -y wireguard-tools iptables-persistent qrencode jq
+    # 停止并禁用所有接口
+    for iface in $(list_interfaces); do
+        systemctl stop "wg-quick@$iface" 2>/dev/null
+    done
+    
+    # 停止并禁用恢复服务
+    systemctl stop wg-snat-restore.service 2>/dev/null
+    systemctl disable wg-snat-restore.service 2>/dev/null
+    
+    # 删除定时任务
+    crontab -l 2>/dev/null | grep -v "restore-wg-snat.sh" | crontab -
+    
+    # 卸载软件包
+    apt-get purge -y wireguard-tools iptables-persistent qrencode jq cron
+    
+    # 删除配置文件
     rm -rf "$CONFIG_DIR"
-    echo "WireGuard已卸载"
+    rm -f /etc/systemd/system/wg-snat-restore.service
+    rm -f /usr/local/bin/restore-wg-snat.sh
+    rm -f /etc/iptables/rules.v4
+    
+    systemctl daemon-reload
+    
+    echo "WireGuard已完全卸载"
+    log "WireGuard卸载完成"
 }
 
 # ========================
@@ -465,7 +766,8 @@ main_menu() {
 # ========================
 # 脚本入口
 # ========================
-mkdir -p "$CLIENT_DIR/$FIXED_IFACE"
+mkdir -p "$CONFIG_DIR"
+mkdir -p "$CLIENT_DIR"
 touch "$LOG_FILE"
 chmod 600 "$LOG_FILE"
 init_resources
