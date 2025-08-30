@@ -100,6 +100,45 @@ install_dependencies() {
 }
 
 # ========================
+# 公网IP自动检测
+# ========================
+detect_public_ips() {
+    echo "正在自动检测公网IP..."
+    log "开始检测公网IP"
+    
+    local public_ips=()
+    while IFS= read -r ip; do
+        IFS=. read -r a b c d <<< "$ip"
+        private=false
+        [[ $a -eq 10 ]] && private=true
+        [[ $a -eq 172 && $b -ge 16 && $b -le 31 ]] && private=true
+        [[ $a -eq 192 && $b -eq 168 ]] && private=true
+        [[ $a -eq 127 ]] && private=true
+        [[ $a -eq 169 && $b -eq 254 ]] && private=true
+
+        if ! $private; then
+            public_ips+=("$ip")
+        fi
+    done < <(ip -4 addr show 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d'/' -f1)
+
+    if [ ${#public_ips[@]} -eq 0 ]; then
+        log "尝试通过metadata获取云厂商公网IP"
+        cloud_ip=$(curl -s --connect-timeout 2 http://169.254.169.254/latest/meta-data/public-ipv4 || true)
+        [ -n "$cloud_ip" ] && public_ips+=("$cloud_ip")
+    fi
+
+    if [ ${#public_ips[@]} -gt 0 ]; then
+        printf "%s\n" "${public_ips[@]}" > "$PUBLIC_IP_FILE"
+        echo "检测到公网IP：${public_ips[*]}"
+        log "公网IP已保存"
+    else
+        echo "错误: 未检测到公网IP，请手动创建 $PUBLIC_IP_FILE"
+        log "公网IP检测失败"
+        exit 1
+    fi
+}
+
+# ========================
 # IP池管理功能
 # ========================
 init_ip_pool() {
