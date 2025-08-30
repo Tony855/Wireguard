@@ -6,7 +6,7 @@ CLIENT_DIR="$CONFIG_DIR/clients"
 PUBLIC_IP_FILE="$CONFIG_DIR/public_ips.txt"
 USED_IP_FILE="$CONFIG_DIR/used_ips.txt"
 FIXED_IFACE="wg0"  # 固定接口名称
-SUBNET="10.199.199.0/24"  # 固定子网
+SUBNET="10.99.99.0/24"  # 固定子网
 LOG_FILE="/var/log/wireguard-lite.log"
 
 # 检查root权限
@@ -191,7 +191,7 @@ create_interface() {
         return 1
     fi
 
-    ext_if=$(ip route show default | awk '/default/ {print $5; exit}')  # 添加 exit 确保仅取第一个默认路由的接口
+    ext_if=$(ip route show default | awk '/default/ {print $5; exit}')
     [ -z "$ext_if" ] && { 
         echo "错误: 未找到默认出口接口"
         log "未找到出口接口"
@@ -242,8 +242,6 @@ EOF
         return 1
     fi
 }
-
-# ...（后续函数 add_client、delete_client、delete_interface 等保持不变，请直接参考用户原始代码）
 
 add_client() {
     echo "正在添加新客户端..."
@@ -350,8 +348,8 @@ EOF
     mkdir -p "$CLIENT_DIR/$FIXED_IFACE"
     client_file="$CLIENT_DIR/$FIXED_IFACE/$client_name.conf"
     
-    read -p "输入客户端DNS服务器（默认 8.8.8.8,9.9.9.9）: " client_dns
-    client_dns=${client_dns:-"8.8.8.8,9.9.9.9"}
+    read -p "输入客户端DNS服务器（默认 8.8.8.8,1.1.1.1）: " client_dns
+    client_dns=${client_dns:-"8.8.8.8,1.1.1.1"}
 
     cat > "$client_file" <<EOF
 [Interface]
