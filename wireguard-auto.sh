@@ -228,35 +228,35 @@ EOF
 }
 
 add_client() {
-    # 新增：读取服务器信息
-    if [ -f "$CONFIG_DIR/server_info.conf" ]; then
-        source "$CONFIG_DIR/server_info.conf"
-    else
+    # 确保服务器信息存在
+    if [ ! -f "$CONFIG_DIR/server_info.conf" ]; then
         echo "错误：未找到服务器配置信息，请先创建接口。"
         exit 1
     fi
+    source "$CONFIG_DIR/server_info.conf"
 
+    # 验证IP池
     validate_client_ip_allocation
-    echo "正在添加新客户端..."
-    log "开始添加客户端"
+    
+    echo "正在自动添加新客户端..."
+    log "开始自动添加客户端"
 
-    # 分配客户端公网IP
-    client_nat_ip=$(get_available_public_ip) || {
+    # 自动分配客户端公网IP
+    client_nat_ip=$(get_available_public_ip)
+    if [ -z "$client_nat_ip" ]; then
         echo "错误: 没有可用的公网IP"
         exit 1
-    }
-    mark_ip_used "$client_nat_ip" || {
-        echo "IP标记失败: $client_nat_ip"
-        exit 1
-    }
+    fi
+    mark_ip_used "$client_nat_ip"
 
-    # 分配内网IP
-    client_ip=$(generate_client_ip) || {
+    # 自动分配内网IP
+    client_ip=$(generate_client_ip)
+    if [ $? -ne 0 ]; then
         release_ip "$client_nat_ip"
         exit 1
-    }
+    fi
 
-    # 生成客户端密钥
+    # 自动生成密钥
     client_private=$(wg genkey)
     client_public=$(echo "$client_private" | wg pubkey)
     client_preshared=$(wg genpsk)
@@ -272,20 +272,18 @@ PresharedKey = $client_preshared
 AllowedIPs = $client_ip/32
 EOF
 
-    # ================ SNAT规则处理 ================
+    # 自动配置SNAT规则
     ext_if=$(ip route show default | awk '{print $5; exit}')
-    [ -z "$ext_if" ] && {
+    if [ -z "$ext_if" ]; then
         echo "错误: 无法获取默认路由接口" 
         release_ip "$client_nat_ip"
         exit 1
-    }
+    fi
 
-    # 添加SNAT规则
     iptables -t nat -I POSTROUTING 1 -s "$client_ip/32" -o "$ext_if" -j SNAT --to-source "$client_nat_ip"
-    # 持久化规则
     iptables-save > /etc/iptables/rules.v4
 
-    # 生成客户端配置（使用服务器公网IP）
+    # 自动生成客户端配置
     mkdir -p "$CLIENT_DIR"
     client_file="$CLIENT_DIR/${client_nat_ip}.conf"
     cat > "$client_file" <<EOF
@@ -303,22 +301,23 @@ PersistentKeepalive = 25
 PresharedKey = $client_preshared
 EOF
 
-    # 生成二维码
+    # 自动生成二维码
     qrencode -t ansiutf8 < "$client_file"
     qrencode -o "${client_file}.png" < "$client_file"
     chmod 600 "$client_file" "${client_file}.png"
 
-    # 应用配置
+    # 自动应用配置
     if ! wg syncconf $FIXED_IFACE <(wg-quick strip $FIXED_IFACE); then
         systemctl restart wg-quick@$FIXED_IFACE
         log "配置动态加载失败，已执行完整重启"
     fi
 
-    echo "客户端添加成功"
-    echo "出口公网IP: $client_nat_ip"
-    echo "内网IP: $client_ip"
-    echo "配置文件: $client_file"
-    log "客户端添加: $client_nat_ip"
+    echo "✅ 客户端添加成功"
+    echo "📱 出口公网IP: $client_nat_ip"
+    echo "🔒 内网IP: $client_ip"
+    echo "📄 配置文件: $client_file"
+    echo "📟 二维码文件: ${client_file}.png"
+    log "客户端自动添加成功: $client_nat_ip"
 }
 
 delete_client() {
